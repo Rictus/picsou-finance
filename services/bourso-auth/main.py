@@ -359,8 +359,30 @@ async def _login(client: httpx.AsyncClient, customer_id: str, password: str) -> 
         raise HTTPException(status_code=502, detail="UPSTREAM_FORMAT_CHANGED")
 
 
-async def _home(client: httpx.AsyncClient) -> str:
-    return (await client.get("/", follow_redirects=True)).text
+async def _home_response(client: httpx.AsyncClient) -> httpx.Response:
+    return await client.get("/", follow_redirects=True)
+
+
+def lands_on_securisation(response: httpx.Response) -> bool:
+    """Whether a followed redirect ended on BoursoBank's second-factor page.
+
+    The page still carries the logout link, so `_LOGGED_IN_MARKER` alone is not
+    proof of a completed session.
+    """
+    path = urlsplit(str(response.url)).path
+    return path == SECURISATION_PATH or path.startswith(SECURISATION_PATH + "/")
+
+
+def requires_app_push(response: httpx.Response, home: str) -> bool:
+    """Whether login must continue through the app-push challenge.
+
+    A securisation landing is the authoritative signal, even when the page also
+    carries the logout link. The text fallback keeps the old behaviour for a
+    page served at another path.
+    """
+    return lands_on_securisation(response) or (
+        SECURISATION_PATH in home and _LOGGED_IN_MARKER not in home
+    )
 
 
 def is_fraud_education_page(home: str) -> bool:
@@ -536,6 +558,15 @@ def redirects_to_identity_selector(response: httpx.Response) -> bool:
     return target.host == httpx.URL(BASE_URL).host and target.path.rstrip("/") == IDENTITY_SELECTOR_PATH
 
 
+def redirects_to_securisation(response: httpx.Response) -> bool:
+    if not response.is_redirect:
+        return False
+    target = httpx.URL(BASE_URL).join(response.headers.get("location", ""))
+    return target.host == httpx.URL(BASE_URL).host and (
+        target.path == SECURISATION_PATH or target.path.startswith(SECURISATION_PATH + "/")
+    )
+
+
 async def _get_dashboard(client: httpx.AsyncClient) -> httpx.Response:
     return await client.get(ACCOUNTS_PATH, headers={"X-Requested-With": "XMLHttpRequest"})
 
@@ -548,12 +579,16 @@ async def _dashboard(client: httpx.AsyncClient) -> tuple[str, bool]:
     it means the flow is not the one this was written against.
     """
     response = await _get_dashboard(client)
+    if redirects_to_securisation(response):
+        raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
     if not redirects_to_identity_selector(response):
         return response.text, False
 
     selector = (await client.get(IDENTITY_SELECTOR_PATH, follow_redirects=True)).text
     await client.get(choose_personal_identity(selector), follow_redirects=True)
     response = await _get_dashboard(client)
+    if redirects_to_securisation(response):
+        raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
     if redirects_to_identity_selector(response):
         raise AccountsFormatError(
             FORMAT_CHANGED, "Identity selector was served again after switching identity"
@@ -642,15 +677,19 @@ async def _read_history(client: httpx.AsyncClient, entry: dict[str, Any], href: 
 async def _collect_accounts(client: httpx.AsyncClient) -> list[AccountPayload]:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + ACCOUNTS_HISTORY_DEADLINE_SECONDS
-    home = await _home(client)
-    if _LOGGED_IN_MARKER not in home:
+    home_response = await _home_response(client)
+    home = home_response.text
+    if _LOGGED_IN_MARKER not in home or lands_on_securisation(home_response):
         raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
 
     dashboard, switched = await _dashboard(client)
     if switched:
         # BRS_CONFIG is re-read from the switched session: nothing says its
         # USER_HASH is shared across identities, and the trading calls use it.
-        home = await _home(client)
+        home_response = await _home_response(client)
+        home = home_response.text
+        if _LOGGED_IN_MARKER not in home or lands_on_securisation(home_response):
+            raise HTTPException(status_code=401, detail="SESSION_EXPIRED")
     api_url, user_hash = extract_brs_config(home)
 
     accounts, third_party = parse_dashboard(dashboard)
@@ -737,7 +776,21 @@ async def initiate(req: InitiateRequest) -> dict:
     keep_client = False
     try:
         await _login(client, req.customerId, req.password)
-        home = await _home(client)
+        home_response = await _home_response(client)
+        home = home_response.text
+
+        if requires_app_push(home_response, home):
+            state = await _start_app_push(client)
+            state["client"] = client
+            state["created_at"] = time.time()
+            await _pending.put_or_raise(process_id, state)
+            keep_client = True
+            return {
+                "processId": process_id,
+                "mfaRequired": True,
+                "mfaType": "APP_PUSH",
+                "sessionState": None,
+            }
 
         if _LOGGED_IN_MARKER in home:
             return {
@@ -747,29 +800,17 @@ async def initiate(req: InitiateRequest) -> dict:
                 "sessionState": serialize_cookies(client),
             }
 
-        if SECURISATION_PATH not in home:
-            if is_fraud_education_page(home):
-                # The password was accepted (login POST 302) but BoursoBank
-                # wants the account holder to acknowledge its fraud-prevention
-                # notice on the real website first. Never auto-tick it: it is
-                # a legal notice only the holder can accept.
-                raise HTTPException(status_code=401, detail="FRAUD_ACK_REQUIRED")
-            # The login POST redirected somewhere that is neither the dashboard
-            # nor a second factor. BoursoBank answers a wrong password this way
-            # once the form has already been accepted.
-            raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
+        if is_fraud_education_page(home):
+            # The password was accepted (login POST 302) but BoursoBank
+            # wants the account holder to acknowledge its fraud-prevention
+            # notice on the real website first. Never auto-tick it: it is
+            # a legal notice only the holder can accept.
+            raise HTTPException(status_code=401, detail="FRAUD_ACK_REQUIRED")
 
-        state = await _start_app_push(client)
-        state["client"] = client
-        state["created_at"] = time.time()
-        await _pending.put_or_raise(process_id, state)
-        keep_client = True
-        return {
-            "processId": process_id,
-            "mfaRequired": True,
-            "mfaType": "APP_PUSH",
-            "sessionState": None,
-        }
+        # The login POST redirected somewhere that is neither the dashboard
+        # nor a second factor. BoursoBank answers a wrong password this way
+        # once the form has already been accepted.
+        raise HTTPException(status_code=401, detail="INVALID_CREDENTIALS")
     except AccountsFormatError as exc:
         log.warning("BoursoBank login rejected (code=%s): %s", exc.code, exc)
         raise HTTPException(status_code=502, detail=exc.code) from exc
@@ -800,7 +841,8 @@ async def complete(req: CompleteRequest) -> dict:
         if not await _await_app_push(client, state):
             raise HTTPException(status_code=408, detail="APP_VALIDATION_TIMEOUT")
         await _confirm_validation(client, state["validationToken"])
-        if _LOGGED_IN_MARKER not in await _home(client):
+        home_response = await _home_response(client)
+        if _LOGGED_IN_MARKER not in home_response.text or lands_on_securisation(home_response):
             raise HTTPException(status_code=502, detail="UPSTREAM_FORMAT_CHANGED")
         return {"sessionState": serialize_cookies(client)}
     except AccountsFormatError as exc:

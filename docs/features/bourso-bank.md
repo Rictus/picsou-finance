@@ -156,8 +156,10 @@ to execute. That keeps this sidecar a tenth the size of the Playwright ones.
 4. `POST /connexion/saisie-mot-de-passe` — a *multipart* form with eight fields.
    Anything but a 302 is a failure; the two known French error strings map to
    `INVALID_CREDENTIALS`.
-5. `GET /` — `href="/se-deconnecter"` means signed in, `/securisation` means a
-   second factor.
+5. `GET /` — follow redirects and read the **final path**: `/securisation` means
+   a second factor. That page also carries `href="/se-deconnecter"`, so the
+   logout link alone is not proof of a completed session; only a non-securisation
+   final path with that marker is.
 
 #### The second factor is app-push only
 
@@ -466,6 +468,11 @@ See [the ADR](../decisions/2026-08-11-boursobank-httpx-sidecar.md).
   it and answers every route except `/health` with a 401 `Picsou-Sidecar-Key`
   challenge unless the backend presents it. That 401 is not a bank rejection;
   see [docker-deployment.md](./docker-deployment.md#sidecar-shared-secret--app_sidecar_api_key).
+- **`/securisation` also carries the logout link.** `href="/se-deconnecter"` is
+  not proof of a completed session: BoursoBank serves it on the second-factor
+  page too. Check the final path first; otherwise login stores a partial session
+  and `/accounts` fails with `UPSTREAM_FORMAT_CHANGED` ("Dashboard carried no
+  account section") instead of asking for the app push.
 - **The pad digit is an image, not text.** `<button data-matrix-key="XYZ">` wraps
   an `<img src="data:image/svg+xml;base64,…">`. Do not "simplify" the digest
   lookup back into reading the button's text — there is no text.

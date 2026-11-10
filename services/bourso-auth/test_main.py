@@ -20,13 +20,19 @@ from fixtures import DASHBOARD_HTML, MOVEMENTS_HTML, RIB_HTML
 from main import (
     BASE_URL,
     AccountsRequest,
+    InitiateRequest,
     _collect_accounts,
     _json_success,
+    _pending,
     _strong_auth_params,
     extract_brs_config,
     extract_form_token,
+    initiate,
     is_fraud_education_page,
+    lands_on_securisation,
     redirects_to_identity_selector,
+    redirects_to_securisation,
+    requires_app_push,
     restore_cookies,
     serialize_cookies,
 )
@@ -48,6 +54,20 @@ HOME_HTML = (
     '"USER_HASH": "61d55b52615fbdf"};</script></head>'
     '<body><a href="/se-deconnecter">Se déconnecter</a></body></html>'
 )
+
+# The regression: BoursoBank's second-factor page also carries the logout link.
+SECURISATION_HTML = (
+    '<html><body><a href="/se-deconnecter">Se déconnecter</a>'
+    "<div>/securisation/validation</div></body></html>"
+)
+
+
+def securisation_response(path="/securisation"):
+    return httpx.Response(
+        200,
+        request=httpx.Request("GET", BASE_URL + path),
+        text=SECURISATION_HTML,
+    )
 
 
 def money(value, currency="EUR"):
@@ -219,6 +239,99 @@ class CookieStateTest(unittest.TestCase):
         source = httpx.Client(base_url=BASE_URL)
         source.cookies.set("brsxds_x", "jwt", domain=".boursobank.com", path="/")
         AccountsRequest(sessionState=serialize_cookies(source))
+
+
+class SecurisationLandingTest(unittest.TestCase):
+    def test_a_securisation_landing_needs_app_push_even_with_the_logout_link(self):
+        self.assertTrue(requires_app_push(securisation_response(), SECURISATION_HTML))
+
+    def test_a_dashboard_with_a_securisation_link_is_not_a_second_factor(self):
+        home = HOME_HTML.replace("</body>", '<a href="/securisation">Sécurité</a></body>')
+        response = httpx.Response(
+            200,
+            request=httpx.Request("GET", BASE_URL + "/"),
+            text=home,
+        )
+        self.assertFalse(requires_app_push(response, home))
+
+    def test_a_securisation_page_without_the_logout_link_still_needs_app_push(self):
+        home = "<html><div>/securisation/validation</div></html>"
+        response = httpx.Response(
+            200,
+            request=httpx.Request("GET", BASE_URL + "/"),
+            text=home,
+        )
+        self.assertTrue(requires_app_push(response, home))
+
+    def test_lands_on_securisation_reads_the_final_path(self):
+        home = httpx.Response(
+            200,
+            request=httpx.Request("GET", BASE_URL + "/"),
+            text=HOME_HTML,
+        )
+        self.assertTrue(lands_on_securisation(securisation_response()))
+        self.assertTrue(lands_on_securisation(securisation_response("/securisation/validation")))
+        self.assertFalse(lands_on_securisation(home))
+
+    def test_only_a_redirect_to_securisation_counts(self):
+        def redirect(location):
+            return httpx.Response(302, headers={"Location": location})
+
+        self.assertTrue(redirects_to_securisation(redirect("/securisation")))
+        self.assertTrue(redirects_to_securisation(redirect("/securisation/validation")))
+        self.assertFalse(redirects_to_securisation(redirect("/connexion/lister-identites")))
+        self.assertFalse(redirects_to_securisation(redirect("https://evil.example/securisation")))
+        self.assertFalse(redirects_to_securisation(httpx.Response(200, text="<html></html>")))
+
+
+class InitiateMfaTest(unittest.IsolatedAsyncioTestCase):
+    async def test_initiate_starts_the_app_push_when_home_lands_on_securisation(self):
+        client = build_client(default_handler())
+        state = {
+            "apiUrl": API_URL,
+            "userHash": USER_HASH,
+            "resourceId": "resource",
+            "formState": "state",
+            "validationToken": "token",
+        }
+        with mock.patch("main._new_client", return_value=client), mock.patch(
+            "main._login", new_callable=mock.AsyncMock
+        ), mock.patch(
+            "main._home_response",
+            new_callable=mock.AsyncMock,
+            return_value=securisation_response(),
+        ), mock.patch(
+            "main._start_app_push",
+            new_callable=mock.AsyncMock,
+            return_value=state,
+        ):
+            result = await initiate(InitiateRequest(customerId="123456", password="1234"))
+        try:
+            self.assertTrue(result["mfaRequired"])
+            self.assertIsNotNone(result["processId"])
+            self.assertEqual(result["mfaType"], "APP_PUSH")
+            pending = await _pending.take(result["processId"])
+            self.assertIsNotNone(pending)
+        finally:
+            await client.aclose()
+
+    async def test_initiate_keeps_the_direct_session_when_home_is_the_dashboard(self):
+        client = build_client(default_handler())
+        home = httpx.Response(
+            200,
+            request=httpx.Request("GET", BASE_URL + "/"),
+            text=HOME_HTML,
+        )
+        with mock.patch("main._new_client", return_value=client), mock.patch(
+            "main._login", new_callable=mock.AsyncMock
+        ), mock.patch("main._home_response", new_callable=mock.AsyncMock, return_value=home):
+            result = await initiate(InitiateRequest(customerId="123456", password="1234"))
+        try:
+            self.assertFalse(result["mfaRequired"])
+            self.assertIsNone(result["processId"])
+            self.assertIn("cookies", result["sessionState"])
+        finally:
+            await client.aclose()
 
 
 class CollectAccountsTest(unittest.IsolatedAsyncioTestCase):
@@ -472,6 +585,34 @@ class CollectAccountsTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_logged_out_home_page_reports_an_expired_session(self):
         async with build_client(default_handler(home="<html>Connexion</html>")) as client:
+            with self.assertRaises(HTTPException) as raised:
+                await _collect_accounts(client)
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.detail, "SESSION_EXPIRED")
+
+    async def test_a_home_page_landing_on_securisation_expires_the_session(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/":
+                return httpx.Response(302, headers={"Location": "/securisation"})
+            if request.url.path == "/securisation":
+                return httpx.Response(200, text=SECURISATION_HTML)
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        async with build_client(handler) as client:
+            with self.assertRaises(HTTPException) as raised:
+                await _collect_accounts(client)
+        self.assertEqual(raised.exception.status_code, 401)
+        self.assertEqual(raised.exception.detail, "SESSION_EXPIRED")
+
+    async def test_a_dashboard_redirect_to_securisation_expires_the_session(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/":
+                return httpx.Response(200, text=HOME_HTML)
+            if request.url.path == "/dashboard/liste-comptes":
+                return httpx.Response(302, headers={"Location": "/securisation"})
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        async with build_client(handler) as client:
             with self.assertRaises(HTTPException) as raised:
                 await _collect_accounts(client)
         self.assertEqual(raised.exception.status_code, 401)

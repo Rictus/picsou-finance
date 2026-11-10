@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BoursoBank login no longer mistakes its second-factor page for a completed session.**
+  `/securisation` carries the same logout link as the dashboard, so the sidecar returned
+  `mfaRequired=false`, stored a partial session, and every sync then failed with
+  `UPSTREAM_FORMAT_CHANGED` ("Dashboard carried no account section"). It now detects the
+  securisation final path, requests the app push, and reports `SESSION_EXPIRED` rather than a
+  website format change when a stored session still lands there.
 - **Family dashboard and MCP history counted Revolut pockets twice.** A Revolut wallet's balance
   is the sum of its pockets, which is why the dashboard leaves pockets out of net worth. The
   family dashboard's shared net worth added each pocket on top of its wallet, and the MCP
