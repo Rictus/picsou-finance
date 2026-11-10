@@ -30,6 +30,7 @@ import html as html_module
 import json
 import re
 import time
+import unicodedata
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
@@ -420,16 +421,89 @@ def _strong_auth_params(page: str) -> tuple[str, str]:
     return resource_id, form_state
 
 
+_SECURISATION_KEYWORDS = (
+    "APPLICATION",
+    "APPAREIL",
+    "AUTHENTIFICATION",
+    "BLOQU",
+    "CODE",
+    "CONNEXION",
+    "EMAIL",
+    "NOTIFICATION",
+    "SMS",
+    "SUSPECT",
+    "TENTATIVE",
+    "VALIDER",
+)
+
+
+def _safe_path(raw: str) -> str:
+    path = urlsplit(html_module.unescape(raw)).path
+    return re.sub(r"[A-Za-z0-9._-]{20,}", ":token", path)
+
+
+def describe_securisation_page(response: httpx.Response, page: str) -> str:
+    """A PII-free structural summary of an unknown second-factor page.
+
+    Logs marker names, data-attribute names, known paths and security keywords
+    only: never text, ids, query strings or anything that could identify the
+    account. It is what lets a new BoursoBank second-factor screen be understood
+    from a user's logs without asking them to share the page itself.
+    """
+    normalised = "".join(
+        char
+        for char in unicodedata.normalize("NFD", page)
+        if unicodedata.category(char) != "Mn"
+    ).upper()
+    markers = {
+        marker: page.count(marker)
+        for marker in (
+            "brs-otp-webtoapp",
+            "brs-otp-sms",
+            "brs-otp-email",
+            "data-strong-authentication-payload",
+        )
+    }
+    data_attrs = sorted(
+        {
+            match.group(1).lower()
+            for match in re.finditer(r"\b(data-[a-z0-9_-]+)\s*=", page, re.IGNORECASE)
+        }
+    )
+    paths = sorted(
+        {
+            _safe_path(match.group(1))
+            for match in re.finditer(
+                r'\b(?:action|href|src)\s*=\s*"([^"]+)"', page, re.IGNORECASE
+            )
+            if urlsplit(html_module.unescape(match.group(1))).path.startswith(
+                ("/securisation", "/connexion")
+            )
+        }
+    )
+    keywords = [word for word in _SECURISATION_KEYWORDS if word in normalised]
+    return (
+        f"status={response.status_code} path={urlsplit(str(response.url)).path} "
+        f"length={len(page)} markers={markers} data_attrs={data_attrs} "
+        f"paths={paths} keywords={keywords}"
+    )
+
+
 async def _start_app_push(client: httpx.AsyncClient) -> dict[str, Any]:
     """Ask BoursoBank to push a validation to the customer's phone."""
     await client.get(SECURISATION_PATH, follow_redirects=True)
-    page = (await client.get(VALIDATION_PATH, follow_redirects=True)).text
+    response = await client.get(VALIDATION_PATH, follow_redirects=True)
+    page = response.text
 
     if "brs-otp-webtoapp" not in page:
         other = re.search(r"brs-otp-(?P<kind>sms|email)", page)
         if other:
             log.info("BoursoBank asked for an unsupported second factor: %s", other.group("kind"))
             raise HTTPException(status_code=501, detail="MFA_TYPE_UNSUPPORTED")
+        log.warning(
+            "BoursoBank securisation page offered no known second factor (%s)",
+            describe_securisation_page(response, page),
+        )
         raise AccountsFormatError(
             "UPSTREAM_FORMAT_CHANGED", "Securisation page offered no known second factor"
         )

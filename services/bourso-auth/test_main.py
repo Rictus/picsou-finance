@@ -25,6 +25,7 @@ from main import (
     _json_success,
     _pending,
     _strong_auth_params,
+    describe_securisation_page,
     extract_brs_config,
     extract_form_token,
     initiate,
@@ -282,6 +283,27 @@ class SecurisationLandingTest(unittest.TestCase):
         self.assertFalse(redirects_to_securisation(redirect("/connexion/lister-identites")))
         self.assertFalse(redirects_to_securisation(redirect("https://evil.example/securisation")))
         self.assertFalse(redirects_to_securisation(httpx.Response(200, text="<html></html>")))
+
+    def test_describe_securisation_page_is_structural_only(self):
+        page = (
+            '<html><body><a href="/connexion/changer-identite/'
+            'abcdef1234567890abcdef1234567890">Tentative de connexion bloquée</a>'
+            '<form action="/securisation/validation?token=secret"></form>'
+            '<div data-strong-authentication-payload="payload"></div>'
+            '<span data-new-widget="1"></span></body></html>'
+        )
+        response = httpx.Response(
+            200,
+            request=httpx.Request("GET", BASE_URL + "/securisation/validation"),
+            text=page,
+        )
+        shape = describe_securisation_page(response, page)
+        self.assertIn("path=/securisation/validation", shape)
+        self.assertIn("data-new-widget", shape)
+        self.assertIn("BLOQU", shape)
+        self.assertIn(":token", shape)
+        self.assertNotIn("abcdef1234567890", shape)
+        self.assertNotIn("secret", shape)
 
 
 class InitiateMfaTest(unittest.IsolatedAsyncioTestCase):
